@@ -88,7 +88,7 @@ async function main(): Promise<void> {
   process.stdout.write(`[entry] listening on port ${address.port}\n`);
 
   await register(address.port);
-  process.stdout.write('[entry] registered; waiting for the env to say done\n');
+  process.stdout.write('[entry] anvil forge registered; waiting for the env to say done\n');
 
   await waitForDone();
   server.close();

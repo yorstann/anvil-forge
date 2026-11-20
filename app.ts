@@ -1,49 +1,62 @@
-// The starter's HTTP surface, exactly as it ships: a health probe and an API root, and a JSON 404
-// for everything else. The contest's real surface — git smart HTTP, REST v3 resources, GraphQL v4 and
-// the MCP endpoint — is what you add (README.md names it, and the rules link below says what scores).
-//
-// app.ts is deliberately separate from main.ts: this is the server, the file you grow; main.ts is the
-// entry <-> env lifecycle and should stay as it is.
+// app.ts — Anvil, a GitHub-compatible git forge in one Node process: git smart HTTP, the
+// REST v3 subset, GraphQL v4 and an MCP endpoint over one in-memory store. Standard library
+// only; main.ts owns the entry <-> env lifecycle, this file is the server.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { handleGit } from './githttp.ts';
+import { handleGraphql } from './graphql.ts';
+import { makeCtx, sendJson, type Ctx } from './http.ts';
+import { handleMcp } from './mcp.ts';
+import { handleRest } from './rest.ts';
+import { Store } from './store.ts';
 
-const JSON_TYPE = 'application/json; charset=utf-8';
+async function dispatch(ctx: Ctx): Promise<void> {
+  const { path, method } = ctx;
 
-/** Answer one request with a JSON body; `headers` go beside the JSON ones. */
-function sendJson(res: ServerResponse, status: number, body: unknown, headers: Readonly<Record<string, string>> = {}): void {
-  const text = `${JSON.stringify(body)}\n`;
-  res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': Buffer.byteLength(text), ...headers });
-  res.end(text);
-}
-
-/** The path of a request URL, or '/' when it does not parse (never a throw from a request). */
-function pathOf(req: IncomingMessage): string {
-  try {
-    return new URL(req.url ?? '/', 'http://entry').pathname;
-  } catch {
-    return '/';
+  // The env's boot check calls this twice: 200 {"ok":true}.
+  if (method === 'GET' && path === '/healthz') {
+    sendJson(ctx, 200, { ok: true });
+    return;
   }
+
+  if (path === '/mcp') {
+    await handleMcp(ctx);
+    return;
+  }
+
+  if (path === '/api/graphql') {
+    await handleGraphql(ctx);
+    return;
+  }
+
+  if (path === '/api/v3' || path.startsWith('/api/v3/')) {
+    await handleRest(ctx);
+    return;
+  }
+
+  // Git smart HTTP lives at /{owner}/{repo}.git/...
+  const segments = path.split('/').filter((segment) => segment !== '');
+  if (segments.length >= 2 && segments[1]!.endsWith('.git')) {
+    await handleGit(ctx);
+    return;
+  }
+
+  sendJson(ctx, 404, { message: 'Not Found' });
 }
 
 /** Build the server. It binds nothing until the caller listens; the entry listens on an ephemeral port. */
 export function createApp(): Server {
+  const store = new Store();
   return createServer((req: IncomingMessage, res: ServerResponse) => {
-    const path = pathOf(req);
-    const method = req.method ?? 'GET';
-
-    // The env's boot check calls this twice: 200 {"ok":true}.
-    if (method === 'GET' && path === '/healthz') {
-      sendJson(res, 200, { ok: true });
-      return;
-    }
-
-    // The GitHub API root: a 200 with the token's scopes, as api.github.com answers GET /.
-    if (method === 'GET' && (path === '/api/v3' || path === '/api/v3/')) {
-      sendJson(res, 200, { current_user_url: '/api/v3/user', rate_limit_url: '/api/v3/rate_limit' }, { 'x-oauth-scopes': 'repo, read:org' });
-      return;
-    }
-
-    // Everything else, every method: GitHub's 404 body.
-    sendJson(res, 404, { message: 'Not Found' });
+    const ctx = makeCtx(store, req, res);
+    dispatch(ctx).catch(() => {
+      // A request must never take the process down: answer 500 and keep serving.
+      try {
+        if (!res.headersSent) sendJson(ctx, 500, { message: 'Internal Server Error' });
+        else res.end();
+      } catch {
+        // the socket is already gone
+      }
+    });
   });
 }
